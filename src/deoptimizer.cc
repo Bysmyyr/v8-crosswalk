@@ -798,6 +798,23 @@ void Deoptimizer::DoComputeOutputFrames() {
         break;
       case TranslatedFrame::kInvalid:
         FATAL("invalid frame");
+      case Translation::BEGIN:
+      case Translation::REGISTER:
+      case Translation::INT32_REGISTER:
+      case Translation::UINT32_REGISTER:
+      case Translation::BOOL_REGISTER:
+      case Translation::DOUBLE_REGISTER:
+      case Translation::STACK_SLOT:
+      case Translation::INT32_STACK_SLOT:
+      case Translation::UINT32_STACK_SLOT:
+      case Translation::BOOL_STACK_SLOT:
+      case Translation::DOUBLE_STACK_SLOT:
+      case Translation::LITERAL:
+      case Translation::ARGUMENTS_OBJECT:
+      case Translation::DUPLICATED_OBJECT:
+      case Translation::CAPTURED_OBJECT:
+      default:
+        FATAL("Unsupported translation");
         break;
     }
   }
@@ -1600,6 +1617,9 @@ void Deoptimizer::DoComputeCompiledStubFrame(TranslationIterator* iterator,
   // Copy the double registers from the input into the output frame.
   CopyDoubleRegisters(output_frame);
 
+  // Copy the simd128 registers from the input into the output frame.
+  CopySIMD128Registers(output_frame);
+
   // Fill registers containing handler and number of parameters.
   SetPlatformCompiledStubRegisters(output_frame, &descriptor);
 
@@ -1633,9 +1653,12 @@ void Deoptimizer::MaterializeHeapObjects(JavaScriptFrameIterator* it) {
   // Walk to the last JavaScript output frame to find out if it has
   // adapted arguments.
   for (int frame_index = 0; frame_index < jsframe_count(); ++frame_index) {
-    if (frame_index != 0) it->Advance();
+    JavaScriptFrame* frame = it->frame();
+    jsframe_functions_.Add(handle(frame->function(), isolate_));
+    jsframe_has_adapted_arguments_.Add(frame->has_adapted_arguments());
   }
-  translated_state_.Prepare(it->frame()->has_adapted_arguments(), stack_fp_);
+
+ translated_state_.Prepare(it->frame()->has_adapted_arguments(), stack_fp_);
 
   for (auto& materialization : values_to_materialize_) {
     Handle<Object> value = materialization.value_->GetValue();
@@ -1646,6 +1669,203 @@ void Deoptimizer::MaterializeHeapObjects(JavaScriptFrameIterator* it) {
              reinterpret_cast<intptr_t>(*value));
       value->ShortPrint(trace_scope_->file());
       PrintF(trace_scope_->file(), "\n");
+
+  // Handlify all tagged object values before triggering any allocation.
+  List<Handle<Object> > values(deferred_objects_tagged_values_.length());
+  for (int i = 0; i < deferred_objects_tagged_values_.length(); ++i) {
+    values.Add(Handle<Object>(deferred_objects_tagged_values_[i], isolate_));
+  }
+
+  // Play it safe and clear all unhandlified values before we continue.
+  deferred_objects_tagged_values_.Clear();
+
+  // Materialize all heap numbers before looking at arguments because when the
+  // output frames are used to materialize arguments objects later on they need
+  // to already contain valid heap numbers.
+  for (int i = 0; i < deferred_heap_numbers_.length(); i++) {
+    HeapNumberMaterializationDescriptor<Address> d = deferred_heap_numbers_[i];
+    Handle<Object> num = isolate_->factory()->NewNumber(d.value());
+    if (trace_scope_ != NULL) {
+      PrintF(trace_scope_->file(),
+             "Materialized a new heap number %p [%e] in slot %p\n",
+             reinterpret_cast<void*>(*num),
+             d.value(),
+             d.destination());
+    }
+    Memory::Object_at(d.destination()) = *num;
+  }
+
+  // Materialize all float32x4 before looking at arguments because when the
+  // output frames are used to materialize arguments objects later on they need
+  // to already contain valid float32x4 values.
+  for (int i = 0; i < deferred_float32x4s_.length(); i++) {
+    SIMD128MaterializationDescriptor<Address> d = deferred_float32x4s_[i];
+    float32x4_value_t x4 = d.value().f4;
+    Handle<Object> float32x4 = isolate_->factory()->NewFloat32x4(x4);
+    if (trace_scope_ != NULL) {
+      PrintF(trace_scope_->file(),
+             "Materialized a new float32x4 %p "
+             "[float32x4(%e, %e, %e, %e)] in slot %p\n",
+             reinterpret_cast<void*>(*float32x4),
+             x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+             d.destination());
+    }
+    Memory::Object_at(d.destination()) = *float32x4;
+  }
+
+  // Materialize all float64x2 before looking at arguments because when the
+  // output frames are used to materialize arguments objects later on they need
+  // to already contain valid float64x2 values.
+  for (int i = 0; i < deferred_float64x2s_.length(); i++) {
+    SIMD128MaterializationDescriptor<Address> d = deferred_float64x2s_[i];
+    float64x2_value_t x2 = d.value().d2;
+    Handle<Object> float64x2 = isolate_->factory()->NewFloat64x2(x2);
+    if (trace_scope_ != NULL) {
+      PrintF(trace_scope_->file(),
+             "Materialized a new float64x2 %p "
+             "[float64x2(%e, %e)] in slot %p\n",
+             reinterpret_cast<void*>(*float64x2),
+             x2.storage[0], x2.storage[1],
+             d.destination());
+    }
+    Memory::Object_at(d.destination()) = *float64x2;
+  }
+
+  // Materialize all int32x4 before looking at arguments because when the
+  // output frames are used to materialize arguments objects later on they need
+  // to already contain valid int32x4 values.
+  for (int i = 0; i < deferred_int32x4s_.length(); i++) {
+    SIMD128MaterializationDescriptor<Address> d = deferred_int32x4s_[i];
+    int32x4_value_t x4 = d.value().i4;
+    Handle<Object> int32x4 = isolate_->factory()->NewInt32x4(x4);
+    if (trace_scope_ != NULL) {
+      PrintF(trace_scope_->file(),
+             "Materialized a new int32x4 %p "
+             "[int32x4(%u, %u, %u, %u)] in slot %p\n",
+             reinterpret_cast<void*>(*int32x4),
+             x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+             d.destination());
+    }
+    Memory::Object_at(d.destination()) = *int32x4;
+  }
+
+
+  // Materialize all heap numbers required for arguments/captured objects.
+  for (int i = 0; i < deferred_objects_double_values_.length(); i++) {
+    HeapNumberMaterializationDescriptor<int> d =
+        deferred_objects_double_values_[i];
+    Handle<Object> num = isolate_->factory()->NewNumber(d.value());
+    if (trace_scope_ != NULL) {
+      PrintF(trace_scope_->file(),
+             "Materialized a new heap number %p [%e] for object at %d\n",
+             reinterpret_cast<void*>(*num),
+             d.value(),
+             d.destination());
+    }
+    DCHECK(values.at(d.destination())->IsTheHole());
+    values.Set(d.destination(), num);
+  }
+
+  // Play it safe and clear all object double values before we continue.
+  deferred_objects_double_values_.Clear();
+
+  // Materialize all float32x4 values required for arguments/captured objects.
+  for (int i = 0; i < deferred_objects_float32x4_values_.length(); i++) {
+    SIMD128MaterializationDescriptor<int> d =
+        deferred_objects_float32x4_values_[i];
+    float32x4_value_t x4 = d.value().f4;
+    Handle<Object> float32x4 = isolate_->factory()->NewFloat32x4(x4);
+    if (trace_scope_ != NULL) {
+      PrintF(trace_scope_->file(),
+             "Materialized a new float32x4 %p "
+             "[float32x4(%e, %e, %e, %e)] for object at %d\n",
+             reinterpret_cast<void*>(*float32x4),
+             x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+             d.destination());
+    }
+    DCHECK(values.at(d.destination())->IsTheHole());
+    values.Set(d.destination(), float32x4);
+  }
+
+  // Play it safe and clear all object float32x4 values before we continue.
+  deferred_objects_float32x4_values_.Clear();
+
+  // Materialize all float64x2 values required for arguments/captured objects.
+  for (int i = 0; i < deferred_objects_float64x2_values_.length(); i++) {
+    SIMD128MaterializationDescriptor<int> d =
+        deferred_objects_float64x2_values_[i];
+    float64x2_value_t x2 = d.value().d2;
+    Handle<Object> float64x2 = isolate_->factory()->NewFloat64x2(x2);
+    if (trace_scope_ != NULL) {
+      PrintF(trace_scope_->file(),
+             "Materialized a new float64x2 %p "
+             "[float64x2(%e, %e)] for object at %d\n",
+             reinterpret_cast<void*>(*float64x2),
+             x2.storage[0], x2.storage[1],
+             d.destination());
+    }
+    DCHECK(values.at(d.destination())->IsTheHole());
+    values.Set(d.destination(), float64x2);
+  }
+
+  // Play it safe and clear all object float64x2 values before we continue.
+  deferred_objects_float64x2_values_.Clear();
+
+  // Materialize all int32x4 values required for arguments/captured objects.
+  for (int i = 0; i < deferred_objects_int32x4_values_.length(); i++) {
+    SIMD128MaterializationDescriptor<int> d =
+        deferred_objects_int32x4_values_[i];
+    int32x4_value_t x4 = d.value().i4;
+    Handle<Object> int32x4 = isolate_->factory()->NewInt32x4(x4);
+    if (trace_scope_ != NULL) {
+      PrintF(trace_scope_->file(),
+             "Materialized a new int32x4 %p "
+             "[int32x4(%u, %u, %u, %u)] for object at %d\n",
+             reinterpret_cast<void*>(*int32x4),
+             x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+             d.destination());
+    }
+    DCHECK(values.at(d.destination())->IsTheHole());
+    values.Set(d.destination(), int32x4);
+  }
+
+  // Play it safe and clear all object int32x4 values before we continue.
+  deferred_objects_int32x4_values_.Clear();
+
+  // Materialize arguments/captured objects.
+  if (!deferred_objects_.is_empty()) {
+    List<Handle<Object> > materialized_objects(deferred_objects_.length());
+    materialized_objects_ = &materialized_objects;
+    materialized_values_ = &values;
+
+    while (materialization_object_index_ < deferred_objects_.length()) {
+      int object_index = materialization_object_index_;
+      ObjectMaterializationDescriptor descriptor =
+          deferred_objects_.at(object_index);
+
+      // Find a previously materialized object by de-duplication or
+      // materialize a new instance of the object if necessary. Store
+      // the materialized object into the frame slot.
+      Handle<Object> object = MaterializeNextHeapObject();
+      if (descriptor.slot_address() != NULL) {
+        Memory::Object_at(descriptor.slot_address()) = *object;
+      }
+      if (trace_scope_ != NULL) {
+        if (descriptor.is_arguments()) {
+          PrintF(trace_scope_->file(),
+                 "Materialized %sarguments object of length %d for %p: ",
+                 ArgumentsObjectIsAdapted(object_index) ? "(adapted) " : "",
+                 Handle<JSObject>::cast(object)->elements()->length(),
+                 reinterpret_cast<void*>(descriptor.slot_address()));
+        } else {
+          PrintF(trace_scope_->file(),
+                 "Materialized captured object of size %d for %p: ",
+                 Handle<HeapObject>::cast(object)->Size(),
+                 reinterpret_cast<void*>(descriptor.slot_address()));
+        }
+        object->ShortPrint(trace_scope_->file());
+        PrintF(trace_scope_->file(), "\n");
+      }
     }
 
     *(reinterpret_cast<intptr_t*>(materialization.output_slot_address_)) =
@@ -1775,6 +1995,797 @@ unsigned Deoptimizer::ComputeInputFrameSize() const {
 }
 
 
+    case Translation::INT32_REGISTER: {
+      int input_reg = iterator->Next();
+      intptr_t value = input_->GetRegister(input_reg);
+      bool is_smi = Smi::IsValid(value);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        PrintF(trace_scope_->file(),
+               "%" V8PRIdPTR " ; %s (%s)\n", value,
+               converter.NameOfCPURegister(input_reg),
+               TraceValueType(is_smi));
+      }
+      if (is_smi) {
+        intptr_t tagged_value =
+            reinterpret_cast<intptr_t>(Smi::FromInt(static_cast<int>(value)));
+        AddObjectTaggedValue(tagged_value);
+      } else {
+        double double_value = static_cast<double>(static_cast<int32_t>(value));
+        AddObjectDoubleValue(double_value);
+      }
+      return;
+    }
+
+    case Translation::UINT32_REGISTER: {
+      int input_reg = iterator->Next();
+      uintptr_t value = static_cast<uintptr_t>(input_->GetRegister(input_reg));
+      bool is_smi = (value <= static_cast<uintptr_t>(Smi::kMaxValue));
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        PrintF(trace_scope_->file(), "%" V8PRIuPTR " ; uint %s (%s)\n", value,
+               converter.NameOfCPURegister(input_reg), TraceValueType(is_smi));
+      }
+      if (is_smi) {
+        intptr_t tagged_value =
+            reinterpret_cast<intptr_t>(Smi::FromInt(static_cast<int>(value)));
+        AddObjectTaggedValue(tagged_value);
+      } else {
+        double double_value = static_cast<double>(static_cast<uint32_t>(value));
+        AddObjectDoubleValue(double_value);
+      }
+      return;
+    }
+
+    case Translation::BOOL_REGISTER: {
+      int input_reg = iterator->Next();
+      uintptr_t value = static_cast<uintptr_t>(input_->GetRegister(input_reg));
+      bool is_smi = (value <= static_cast<uintptr_t>(Smi::kMaxValue));
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot), field_index);
+        PrintF(trace_scope_->file(), "%" V8PRIuPTR " ; bool %s (%s)\n", value,
+               converter.NameOfCPURegister(input_reg), TraceValueType(is_smi));
+      }
+      if (value == 0) {
+        AddObjectTaggedValue(
+            reinterpret_cast<intptr_t>(isolate_->heap()->false_value()));
+      } else {
+        DCHECK_EQ(1U, value);
+        AddObjectTaggedValue(
+            reinterpret_cast<intptr_t>(isolate_->heap()->true_value()));
+      }
+      return;
+    }
+
+    case Translation::DOUBLE_REGISTER: {
+      int input_reg = iterator->Next();
+      double value = input_->GetDoubleRegister(input_reg);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        PrintF(trace_scope_->file(),
+               "%e ; %s\n", value,
+               DoubleRegister::AllocationIndexToString(input_reg));
+      }
+      AddObjectDoubleValue(value);
+      return;
+    }
+
+    case Translation::FLOAT32x4_REGISTER:
+    case Translation::FLOAT64x2_REGISTER:
+    case Translation::INT32x4_REGISTER: {
+      int input_reg = iterator->Next();
+      simd128_value_t value = input_->GetSIMD128Register(input_reg);
+      if (trace_scope_ != NULL) {
+        if (opcode == Translation::FLOAT32x4_REGISTER) {
+          float32x4_value_t x4 = value.f4;
+          PrintF(trace_scope_->file(),
+                 "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+                 reinterpret_cast<intptr_t>(object_slot),
+                 field_index);
+          PrintF(trace_scope_->file(),
+                 "float32x4(%e, %e, %e, %e) ; %s\n",
+                 x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+                 SIMD128Register::AllocationIndexToString(input_reg));
+        } else if (opcode == Translation::FLOAT64x2_REGISTER) {
+          float64x2_value_t x2 = value.d2;
+          PrintF(trace_scope_->file(),
+                 "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+                 reinterpret_cast<intptr_t>(object_slot),
+                 field_index);
+          PrintF(trace_scope_->file(),
+                 "float64x2(%e, %e) ; %s\n",
+                 x2.storage[0], x2.storage[1],
+                 SIMD128Register::AllocationIndexToString(input_reg));
+        } else {
+          DCHECK(opcode == Translation::INT32x4_REGISTER);
+          int32x4_value_t x4 = value.i4;
+          PrintF(trace_scope_->file(),
+                 "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+                 reinterpret_cast<intptr_t>(object_slot),
+                 field_index);
+          PrintF(trace_scope_->file(),
+                 "int32x4(%u, %u, %u, %u) ; %s\n",
+                 x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+                 SIMD128Register::AllocationIndexToString(input_reg));
+        }
+      }
+      AddObjectSIMD128Value(value, opcode);
+      return;
+    }
+
+    case Translation::STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      intptr_t input_value = input_->GetFrameSlot(input_offset);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        PrintF(trace_scope_->file(),
+               "0x%08" V8PRIxPTR " ; [sp + %d] ", input_value, input_offset);
+        reinterpret_cast<Object*>(input_value)->ShortPrint(
+            trace_scope_->file());
+        PrintF(trace_scope_->file(),
+               "\n");
+      }
+      AddObjectTaggedValue(input_value);
+      return;
+    }
+
+    case Translation::INT32_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      intptr_t value = input_->GetFrameSlot(input_offset);
+      bool is_smi = Smi::IsValid(value);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        PrintF(trace_scope_->file(),
+               "%" V8PRIdPTR " ; [sp + %d] (%s)\n",
+               value, input_offset, TraceValueType(is_smi));
+      }
+      if (is_smi) {
+        intptr_t tagged_value =
+            reinterpret_cast<intptr_t>(Smi::FromInt(static_cast<int>(value)));
+        AddObjectTaggedValue(tagged_value);
+      } else {
+        double double_value = static_cast<double>(static_cast<int32_t>(value));
+        AddObjectDoubleValue(double_value);
+      }
+      return;
+    }
+
+    case Translation::UINT32_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      uintptr_t value =
+          static_cast<uintptr_t>(input_->GetFrameSlot(input_offset));
+      bool is_smi = (value <= static_cast<uintptr_t>(Smi::kMaxValue));
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        PrintF(trace_scope_->file(), "%" V8PRIuPTR " ; [sp + %d] (uint %s)\n",
+               value, input_offset, TraceValueType(is_smi));
+      }
+      if (is_smi) {
+        intptr_t tagged_value =
+            reinterpret_cast<intptr_t>(Smi::FromInt(static_cast<int>(value)));
+        AddObjectTaggedValue(tagged_value);
+      } else {
+        double double_value = static_cast<double>(static_cast<uint32_t>(value));
+        AddObjectDoubleValue(double_value);
+      }
+      return;
+    }
+
+    case Translation::BOOL_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      uintptr_t value =
+          static_cast<uintptr_t>(input_->GetFrameSlot(input_offset));
+      bool is_smi = (value <= static_cast<uintptr_t>(Smi::kMaxValue));
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot), field_index);
+        PrintF(trace_scope_->file(), "%" V8PRIuPTR " ; [sp + %d] (bool %s)\n",
+               value, input_offset, TraceValueType(is_smi));
+      }
+      if (value == 0) {
+        AddObjectTaggedValue(
+            reinterpret_cast<intptr_t>(isolate_->heap()->false_value()));
+      } else {
+        DCHECK_EQ(1U, value);
+        AddObjectTaggedValue(
+            reinterpret_cast<intptr_t>(isolate_->heap()->true_value()));
+      }
+      return;
+    }
+
+    case Translation::DOUBLE_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      double value = input_->GetDoubleFrameSlot(input_offset);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        PrintF(trace_scope_->file(),
+               "%e ; [sp + %d]\n", value, input_offset);
+      }
+      AddObjectDoubleValue(value);
+      return;
+    }
+
+    case Translation::FLOAT32x4_STACK_SLOT:
+    case Translation::FLOAT64x2_STACK_SLOT:
+    case Translation::INT32x4_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      simd128_value_t value = input_->GetSIMD128FrameSlot(input_offset);
+      if (trace_scope_ != NULL) {
+        if (opcode == Translation::FLOAT32x4_STACK_SLOT) {
+          float32x4_value_t x4 = value.f4;
+          PrintF(trace_scope_->file(),
+                 "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+                 reinterpret_cast<intptr_t>(object_slot),
+                 field_index);
+          PrintF(trace_scope_->file(),
+                 "float32x4(%e, %e, %e, %e) ; [sp + %d]\n",
+                 x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+                 input_offset);
+        } else if (opcode == Translation::FLOAT64x2_STACK_SLOT) {
+          float64x2_value_t x2 = value.d2;
+          PrintF(trace_scope_->file(),
+                 "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+                 reinterpret_cast<intptr_t>(object_slot),
+                 field_index);
+          PrintF(trace_scope_->file(),
+                 "float64x2(%e, %e) ; [sp + %d]\n",
+                 x2.storage[0], x2.storage[1],
+                 input_offset);
+        } else {
+          DCHECK(opcode == Translation::INT32x4_STACK_SLOT);
+          int32x4_value_t x4 = value.i4;
+          PrintF(trace_scope_->file(),
+                 "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+                 reinterpret_cast<intptr_t>(object_slot),
+                 field_index);
+          PrintF(trace_scope_->file(),
+                 "int32x4(%u, %u, %u, %u) ; [sp + %d]\n",
+                 x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+                 input_offset);
+        }
+      }
+      AddObjectSIMD128Value(value, opcode);
+      return;
+    }
+
+    case Translation::LITERAL: {
+      Object* literal = ComputeLiteral(iterator->Next());
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      object @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        literal->ShortPrint(trace_scope_->file());
+        PrintF(trace_scope_->file(),
+               " ; literal\n");
+      }
+      intptr_t value = reinterpret_cast<intptr_t>(literal);
+      AddObjectTaggedValue(value);
+      return;
+    }
+
+    case Translation::DUPLICATED_OBJECT: {
+      int object_index = iterator->Next();
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      nested @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        isolate_->heap()->arguments_marker()->ShortPrint(trace_scope_->file());
+        PrintF(trace_scope_->file(),
+               " ; duplicate of object #%d\n", object_index);
+      }
+      // Use the materialization marker value as a sentinel and fill in
+      // the object after the deoptimized frame is built.
+      intptr_t value = reinterpret_cast<intptr_t>(
+          isolate_->heap()->arguments_marker());
+      AddObjectDuplication(0, object_index);
+      AddObjectTaggedValue(value);
+      return;
+    }
+
+    case Translation::ARGUMENTS_OBJECT:
+    case Translation::CAPTURED_OBJECT: {
+      int length = iterator->Next();
+      bool is_args = opcode == Translation::ARGUMENTS_OBJECT;
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "      nested @0x%08" V8PRIxPTR ": [field #%d] <- ",
+               reinterpret_cast<intptr_t>(object_slot),
+               field_index);
+        isolate_->heap()->arguments_marker()->ShortPrint(trace_scope_->file());
+        PrintF(trace_scope_->file(),
+               " ; object (length = %d, is_args = %d)\n", length, is_args);
+      }
+      // Use the materialization marker value as a sentinel and fill in
+      // the object after the deoptimized frame is built.
+      intptr_t value = reinterpret_cast<intptr_t>(
+          isolate_->heap()->arguments_marker());
+      AddObjectStart(0, length, is_args);
+      AddObjectTaggedValue(value);
+      // We save the object values on the side and materialize the actual
+      // object after the deoptimized frame is built.
+      int object_index = deferred_objects_.length() - 1;
+      for (int i = 0; i < length; i++) {
+        DoTranslateObject(iterator, object_index, i);
+      }
+      return;
+    }
+  }
+
+  FATAL("Unexpected translation opcode");
+}
+
+
+void Deoptimizer::DoTranslateCommand(TranslationIterator* iterator,
+                                     int frame_index,
+                                     unsigned output_offset) {
+  disasm::NameConverter converter;
+  // A GC-safe temporary placeholder that we can put in the output frame.
+  const intptr_t kPlaceholder = reinterpret_cast<intptr_t>(Smi::FromInt(0));
+
+  Translation::Opcode opcode =
+      static_cast<Translation::Opcode>(iterator->Next());
+
+  switch (opcode) {
+    case Translation::BEGIN:
+    case Translation::JS_FRAME:
+    case Translation::ARGUMENTS_ADAPTOR_FRAME:
+    case Translation::CONSTRUCT_STUB_FRAME:
+    case Translation::GETTER_STUB_FRAME:
+    case Translation::SETTER_STUB_FRAME:
+    case Translation::COMPILED_STUB_FRAME:
+      FATAL("Unexpected translation opcode");
+      return;
+
+    case Translation::REGISTER: {
+      int input_reg = iterator->Next();
+      intptr_t input_value = input_->GetRegister(input_reg);
+      if (trace_scope_ != NULL) {
+        PrintF(
+            trace_scope_->file(),
+            "    0x%08" V8PRIxPTR ": [top + %d] <- 0x%08" V8PRIxPTR " ; %s ",
+            output_[frame_index]->GetTop() + output_offset,
+            output_offset,
+            input_value,
+            converter.NameOfCPURegister(input_reg));
+        reinterpret_cast<Object*>(input_value)->ShortPrint(
+            trace_scope_->file());
+        PrintF(trace_scope_->file(), "\n");
+      }
+      output_[frame_index]->SetFrameSlot(output_offset, input_value);
+      return;
+    }
+
+    case Translation::INT32_REGISTER: {
+      int input_reg = iterator->Next();
+      intptr_t value = input_->GetRegister(input_reg);
+      bool is_smi = Smi::IsValid(value);
+      if (trace_scope_ != NULL) {
+        PrintF(
+            trace_scope_->file(),
+            "    0x%08" V8PRIxPTR ": [top + %d] <- %" V8PRIdPTR " ; %s (%s)\n",
+            output_[frame_index]->GetTop() + output_offset,
+            output_offset,
+            value,
+            converter.NameOfCPURegister(input_reg),
+            TraceValueType(is_smi));
+      }
+      if (is_smi) {
+        intptr_t tagged_value =
+            reinterpret_cast<intptr_t>(Smi::FromInt(static_cast<int>(value)));
+        output_[frame_index]->SetFrameSlot(output_offset, tagged_value);
+      } else {
+        // We save the untagged value on the side and store a GC-safe
+        // temporary placeholder in the frame.
+        AddDoubleValue(output_[frame_index]->GetTop() + output_offset,
+                       static_cast<double>(static_cast<int32_t>(value)));
+        output_[frame_index]->SetFrameSlot(output_offset, kPlaceholder);
+      }
+      return;
+    }
+
+    case Translation::UINT32_REGISTER: {
+      int input_reg = iterator->Next();
+      uintptr_t value = static_cast<uintptr_t>(input_->GetRegister(input_reg));
+      bool is_smi = value <= static_cast<uintptr_t>(Smi::kMaxValue);
+      if (trace_scope_ != NULL) {
+        PrintF(
+            trace_scope_->file(),
+            "    0x%08" V8PRIxPTR ": [top + %d] <- %" V8PRIuPTR
+            " ; uint %s (%s)\n",
+            output_[frame_index]->GetTop() + output_offset,
+            output_offset,
+            value,
+            converter.NameOfCPURegister(input_reg),
+            TraceValueType(is_smi));
+      }
+      if (is_smi) {
+        intptr_t tagged_value =
+            reinterpret_cast<intptr_t>(Smi::FromInt(static_cast<int>(value)));
+        output_[frame_index]->SetFrameSlot(output_offset, tagged_value);
+      } else {
+        // We save the untagged value on the side and store a GC-safe
+        // temporary placeholder in the frame.
+        AddDoubleValue(output_[frame_index]->GetTop() + output_offset,
+                       static_cast<double>(static_cast<uint32_t>(value)));
+        output_[frame_index]->SetFrameSlot(output_offset, kPlaceholder);
+      }
+      return;
+    }
+
+    case Translation::BOOL_REGISTER: {
+      int input_reg = iterator->Next();
+      uintptr_t value = static_cast<uintptr_t>(input_->GetRegister(input_reg));
+      bool is_smi = value <= static_cast<uintptr_t>(Smi::kMaxValue);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": [top + %d] <- %" V8PRIuPTR
+               " ; bool %s (%s)\n",
+               output_[frame_index]->GetTop() + output_offset, output_offset,
+               value, converter.NameOfCPURegister(input_reg),
+               TraceValueType(is_smi));
+      }
+      if (value == 0) {
+        output_[frame_index]->SetFrameSlot(
+            output_offset,
+            reinterpret_cast<intptr_t>(isolate_->heap()->false_value()));
+      } else {
+        DCHECK_EQ(1U, value);
+        output_[frame_index]->SetFrameSlot(
+            output_offset,
+            reinterpret_cast<intptr_t>(isolate_->heap()->true_value()));
+      }
+      return;
+    }
+
+    case Translation::DOUBLE_REGISTER: {
+      int input_reg = iterator->Next();
+      double value = input_->GetDoubleRegister(input_reg);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": [top + %d] <- %e ; %s\n",
+               output_[frame_index]->GetTop() + output_offset,
+               output_offset,
+               value,
+               DoubleRegister::AllocationIndexToString(input_reg));
+      }
+      // We save the untagged value on the side and store a GC-safe
+      // temporary placeholder in the frame.
+      AddDoubleValue(output_[frame_index]->GetTop() + output_offset, value);
+      output_[frame_index]->SetFrameSlot(output_offset, kPlaceholder);
+      return;
+    }
+
+    case Translation::FLOAT32x4_REGISTER:
+    case Translation::FLOAT64x2_REGISTER:
+    case Translation::INT32x4_REGISTER: {
+      int input_reg = iterator->Next();
+      simd128_value_t value = input_->GetSIMD128Register(input_reg);
+      if (trace_scope_ != NULL) {
+        if (opcode == Translation::FLOAT32x4_REGISTER) {
+          float32x4_value_t x4 = value.f4;
+          PrintF(trace_scope_->file(),
+                 "    0x%08" V8PRIxPTR ":"
+                 " [top + %d] <- float32x4(%e, %e, %e, %e) ; %s\n",
+                 output_[frame_index]->GetTop() + output_offset,
+                 output_offset,
+                 x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+                 SIMD128Register::AllocationIndexToString(input_reg));
+        } else if (opcode == Translation::FLOAT64x2_REGISTER) {
+          float64x2_value_t x2 = value.d2;
+          PrintF(trace_scope_->file(),
+                 "    0x%08" V8PRIxPTR ":"
+                 " [top + %d] <- float64x2(%e, %e) ; %s\n",
+                 output_[frame_index]->GetTop() + output_offset,
+                 output_offset,
+                 x2.storage[0], x2.storage[1],
+                 SIMD128Register::AllocationIndexToString(input_reg));
+        } else {
+          DCHECK(opcode == Translation::INT32x4_REGISTER);
+          int32x4_value_t x4 = value.i4;
+          PrintF(trace_scope_->file(),
+                 "    0x%08" V8PRIxPTR ":"
+                 " [top + %d] <- int32x4(%u, %u, %u, %u) ; %s\n",
+                 output_[frame_index]->GetTop() + output_offset,
+                 output_offset,
+                 x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+                 SIMD128Register::AllocationIndexToString(input_reg));
+        }
+      }
+      // We save the untagged value on the side and store a GC-safe
+      // temporary placeholder in the frame.
+      AddSIMD128Value(output_[frame_index]->GetTop() + output_offset, value,
+                      opcode);
+      output_[frame_index]->SetFrameSlot(output_offset, kPlaceholder);
+      return;
+    }
+
+    case Translation::STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      intptr_t input_value = input_->GetFrameSlot(input_offset);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": ",
+               output_[frame_index]->GetTop() + output_offset);
+        PrintF(trace_scope_->file(),
+               "[top + %d] <- 0x%08" V8PRIxPTR " ; [sp + %d] ",
+               output_offset,
+               input_value,
+               input_offset);
+        reinterpret_cast<Object*>(input_value)->ShortPrint(
+            trace_scope_->file());
+        PrintF(trace_scope_->file(), "\n");
+      }
+      output_[frame_index]->SetFrameSlot(output_offset, input_value);
+      return;
+    }
+
+    case Translation::INT32_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      intptr_t value = input_->GetFrameSlot(input_offset);
+      bool is_smi = Smi::IsValid(value);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": ",
+               output_[frame_index]->GetTop() + output_offset);
+        PrintF(trace_scope_->file(),
+               "[top + %d] <- %" V8PRIdPTR " ; [sp + %d] (%s)\n",
+               output_offset,
+               value,
+               input_offset,
+               TraceValueType(is_smi));
+      }
+      if (is_smi) {
+        intptr_t tagged_value =
+            reinterpret_cast<intptr_t>(Smi::FromInt(static_cast<int>(value)));
+        output_[frame_index]->SetFrameSlot(output_offset, tagged_value);
+      } else {
+        // We save the untagged value on the side and store a GC-safe
+        // temporary placeholder in the frame.
+        AddDoubleValue(output_[frame_index]->GetTop() + output_offset,
+                       static_cast<double>(static_cast<int32_t>(value)));
+        output_[frame_index]->SetFrameSlot(output_offset, kPlaceholder);
+      }
+      return;
+    }
+
+    case Translation::UINT32_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      uintptr_t value =
+          static_cast<uintptr_t>(input_->GetFrameSlot(input_offset));
+      bool is_smi = value <= static_cast<uintptr_t>(Smi::kMaxValue);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": ",
+               output_[frame_index]->GetTop() + output_offset);
+        PrintF(trace_scope_->file(),
+               "[top + %d] <- %" V8PRIuPTR " ; [sp + %d] (uint32 %s)\n",
+               output_offset,
+               value,
+               input_offset,
+               TraceValueType(is_smi));
+      }
+      if (is_smi) {
+        intptr_t tagged_value =
+            reinterpret_cast<intptr_t>(Smi::FromInt(static_cast<int>(value)));
+        output_[frame_index]->SetFrameSlot(output_offset, tagged_value);
+      } else {
+        // We save the untagged value on the side and store a GC-safe
+        // temporary placeholder in the frame.
+        AddDoubleValue(output_[frame_index]->GetTop() + output_offset,
+                       static_cast<double>(static_cast<uint32_t>(value)));
+        output_[frame_index]->SetFrameSlot(output_offset, kPlaceholder);
+      }
+      return;
+    }
+
+    case Translation::BOOL_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      uintptr_t value =
+          static_cast<uintptr_t>(input_->GetFrameSlot(input_offset));
+      bool is_smi = value <= static_cast<uintptr_t>(Smi::kMaxValue);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(), "    0x%08" V8PRIxPTR ": ",
+               output_[frame_index]->GetTop() + output_offset);
+        PrintF(trace_scope_->file(),
+               "[top + %d] <- %" V8PRIuPTR " ; [sp + %d] (uint32 %s)\n",
+               output_offset, value, input_offset, TraceValueType(is_smi));
+      }
+      if (value == 0) {
+        output_[frame_index]->SetFrameSlot(
+            output_offset,
+            reinterpret_cast<intptr_t>(isolate_->heap()->false_value()));
+      } else {
+        DCHECK_EQ(1U, value);
+        output_[frame_index]->SetFrameSlot(
+            output_offset,
+            reinterpret_cast<intptr_t>(isolate_->heap()->true_value()));
+      }
+      return;
+    }
+
+    case Translation::DOUBLE_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      double value = input_->GetDoubleFrameSlot(input_offset);
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": [top + %d] <- %e ; [sp + %d]\n",
+               output_[frame_index]->GetTop() + output_offset,
+               output_offset,
+               value,
+               input_offset);
+      }
+      // We save the untagged value on the side and store a GC-safe
+      // temporary placeholder in the frame.
+      AddDoubleValue(output_[frame_index]->GetTop() + output_offset, value);
+      output_[frame_index]->SetFrameSlot(output_offset, kPlaceholder);
+      return;
+    }
+
+    case Translation::FLOAT32x4_STACK_SLOT:
+    case Translation::FLOAT64x2_STACK_SLOT:
+    case Translation::INT32x4_STACK_SLOT: {
+      int input_slot_index = iterator->Next();
+      unsigned input_offset = input_->GetOffsetFromSlotIndex(input_slot_index);
+      simd128_value_t value = input_->GetSIMD128FrameSlot(input_offset);
+      if (trace_scope_ != NULL) {
+        if (opcode == Translation::FLOAT32x4_STACK_SLOT) {
+          float32x4_value_t x4 = value.f4;
+          PrintF(trace_scope_->file(),
+                 "    0x%08" V8PRIxPTR ": "
+                 "[top + %d] <- float32x4(%e, %e, %e, %e) ; [sp + %d]\n",
+                 output_[frame_index]->GetTop() + output_offset,
+                 output_offset,
+                 x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+                 input_offset);
+        } else if (opcode == Translation::FLOAT64x2_STACK_SLOT) {
+          float64x2_value_t x2 = value.d2;
+          PrintF(trace_scope_->file(),
+                 "    0x%08" V8PRIxPTR ": "
+                 "[top + %d] <- float64x2(%e, %e) ; [sp + %d]\n",
+                 output_[frame_index]->GetTop() + output_offset,
+                 output_offset,
+                 x2.storage[0], x2.storage[1],
+                 input_offset);
+        } else {
+          DCHECK(opcode == Translation::INT32x4_STACK_SLOT);
+          int32x4_value_t x4 = value.i4;
+          PrintF(trace_scope_->file(),
+                 "    0x%08" V8PRIxPTR ": "
+                 "[top + %d] <- int32x4(%u, %u, %u, %u) ; [sp + %d]\n",
+                 output_[frame_index]->GetTop() + output_offset,
+                 output_offset,
+                 x4.storage[0], x4.storage[1], x4.storage[2], x4.storage[3],
+                 input_offset);
+        }
+      }
+      // We save the untagged value on the side and store a GC-safe
+      // temporary placeholder in the frame.
+      AddSIMD128Value(output_[frame_index]->GetTop() + output_offset, value,
+                      opcode);
+      output_[frame_index]->SetFrameSlot(output_offset, kPlaceholder);
+      return;
+    }
+
+    case Translation::LITERAL: {
+      Object* literal = ComputeLiteral(iterator->Next());
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": [top + %d] <- ",
+               output_[frame_index]->GetTop() + output_offset,
+               output_offset);
+        literal->ShortPrint(trace_scope_->file());
+        PrintF(trace_scope_->file(), " ; literal\n");
+      }
+      intptr_t value = reinterpret_cast<intptr_t>(literal);
+      output_[frame_index]->SetFrameSlot(output_offset, value);
+      return;
+    }
+
+    case Translation::DUPLICATED_OBJECT: {
+      int object_index = iterator->Next();
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": [top + %d] <- ",
+               output_[frame_index]->GetTop() + output_offset,
+               output_offset);
+        isolate_->heap()->arguments_marker()->ShortPrint(trace_scope_->file());
+        PrintF(trace_scope_->file(),
+               " ; duplicate of object #%d\n", object_index);
+      }
+      // Use the materialization marker value as a sentinel and fill in
+      // the object after the deoptimized frame is built.
+      intptr_t value = reinterpret_cast<intptr_t>(
+          isolate_->heap()->arguments_marker());
+      AddObjectDuplication(output_[frame_index]->GetTop() + output_offset,
+                           object_index);
+      output_[frame_index]->SetFrameSlot(output_offset, value);
+      return;
+    }
+
+    case Translation::ARGUMENTS_OBJECT:
+    case Translation::CAPTURED_OBJECT: {
+      int length = iterator->Next();
+      bool is_args = opcode == Translation::ARGUMENTS_OBJECT;
+      if (trace_scope_ != NULL) {
+        PrintF(trace_scope_->file(),
+               "    0x%08" V8PRIxPTR ": [top + %d] <- ",
+               output_[frame_index]->GetTop() + output_offset,
+               output_offset);
+        isolate_->heap()->arguments_marker()->ShortPrint(trace_scope_->file());
+        PrintF(trace_scope_->file(),
+               " ; object (length = %d, is_args = %d)\n", length, is_args);
+      }
+      // Use the materialization marker value as a sentinel and fill in
+      // the object after the deoptimized frame is built.
+      intptr_t value = reinterpret_cast<intptr_t>(
+          isolate_->heap()->arguments_marker());
+      AddObjectStart(output_[frame_index]->GetTop() + output_offset,
+                     length, is_args);
+      output_[frame_index]->SetFrameSlot(output_offset, value);
+      // We save the object values on the side and materialize the actual
+      // object after the deoptimized frame is built.
+      int object_index = deferred_objects_.length() - 1;
+      for (int i = 0; i < length; i++) {
+        DoTranslateObject(iterator, object_index, i);
+      }
+      return;
+    }
+  }
+}
+
+
+unsigned Deoptimizer::ComputeInputFrameSize() const {
+  unsigned fixed_size = ComputeFixedSize(function_);
+  // The fp-to-sp delta already takes the context, constant pool pointer and the
+  // function into account so we have to avoid double counting them.
+  unsigned result = fixed_size + fp_to_sp_delta_ -
+      StandardFrameConstants::kFixedFrameSizeFromFp;
+  if (compiled_code_->kind() == Code::OPTIMIZED_FUNCTION) {
+    unsigned stack_slots = compiled_code_->stack_slots();
+    unsigned outgoing_size = ComputeOutgoingArgumentSize();
+    CHECK(result == fixed_size + (stack_slots * kPointerSize) + outgoing_size);
+  }
+  return result;
+}
+
+
 unsigned Deoptimizer::ComputeFixedSize(JSFunction* function) const {
   // The fixed part of the frame consists of the return address, frame
   // pointer, function, context, and all the incoming arguments.
@@ -1809,6 +2820,82 @@ Object* Deoptimizer::ComputeLiteral(int index) const {
       DeoptimizationInputData::cast(compiled_code_->deoptimization_data());
   FixedArray* literals = data->LiteralArray();
   return literals->get(index);
+}
+
+
+void Deoptimizer::AddObjectStart(intptr_t slot, int length, bool is_args) {
+  ObjectMaterializationDescriptor object_desc(
+      reinterpret_cast<Address>(slot), jsframe_count_, length, -1, is_args);
+  deferred_objects_.Add(object_desc);
+}
+
+
+void Deoptimizer::AddObjectDuplication(intptr_t slot, int object_index) {
+  ObjectMaterializationDescriptor object_desc(
+      reinterpret_cast<Address>(slot), jsframe_count_, -1, object_index, false);
+  deferred_objects_.Add(object_desc);
+}
+
+
+void Deoptimizer::AddObjectTaggedValue(intptr_t value) {
+  deferred_objects_tagged_values_.Add(reinterpret_cast<Object*>(value));
+}
+
+
+void Deoptimizer::AddObjectDoubleValue(double value) {
+  deferred_objects_tagged_values_.Add(isolate()->heap()->the_hole_value());
+  HeapNumberMaterializationDescriptor<int> value_desc(
+      deferred_objects_tagged_values_.length() - 1, value);
+  deferred_objects_double_values_.Add(value_desc);
+}
+
+
+void Deoptimizer::AddObjectSIMD128Value(simd128_value_t value,
+                                        int translation_opcode) {
+  deferred_objects_tagged_values_.Add(isolate()->heap()->the_hole_value());
+  SIMD128MaterializationDescriptor<int> value_desc(
+      deferred_objects_tagged_values_.length() - 1, value);
+  Translation::Opcode opcode =
+      static_cast<Translation::Opcode>(translation_opcode);
+  if (opcode == Translation::FLOAT32x4_REGISTER ||
+      opcode == Translation::FLOAT32x4_STACK_SLOT) {
+    deferred_objects_float32x4_values_.Add(value_desc);
+  } else if (opcode == Translation::FLOAT64x2_REGISTER ||
+             opcode == Translation::FLOAT64x2_STACK_SLOT) {
+    deferred_objects_float64x2_values_.Add(value_desc);
+  } else {
+    DCHECK(opcode == Translation::INT32x4_REGISTER ||
+           opcode == Translation::INT32x4_STACK_SLOT);
+    deferred_objects_int32x4_values_.Add(value_desc);
+  }
+}
+
+
+void Deoptimizer::AddDoubleValue(intptr_t slot_address, double value) {
+  HeapNumberMaterializationDescriptor<Address> value_desc(
+      reinterpret_cast<Address>(slot_address), value);
+  deferred_heap_numbers_.Add(value_desc);
+}
+
+
+void Deoptimizer::AddSIMD128Value(intptr_t slot_address,
+                                  simd128_value_t value,
+                                  int translation_opcode) {
+  SIMD128MaterializationDescriptor<Address> value_desc(
+      reinterpret_cast<Address>(slot_address), value);
+  Translation::Opcode opcode =
+      static_cast<Translation::Opcode>(translation_opcode);
+  if (opcode == Translation::FLOAT32x4_REGISTER ||
+      opcode == Translation::FLOAT32x4_STACK_SLOT) {
+    deferred_float32x4s_.Add(value_desc);
+  } else if (opcode == Translation::FLOAT64x2_REGISTER ||
+             opcode == Translation::FLOAT64x2_STACK_SLOT) {
+    deferred_float64x2s_.Add(value_desc);
+  } else {
+    DCHECK(opcode == Translation::INT32x4_REGISTER ||
+           opcode == Translation::INT32x4_STACK_SLOT);
+    deferred_int32x4s_.Add(value_desc);
+  }
 }
 
 
@@ -2067,6 +3154,12 @@ void Translation::StoreDoubleRegister(DoubleRegister reg) {
 }
 
 
+void Translation::StoreSIMD128Register(SIMD128Register reg, Opcode opcode) {
+  buffer_->Add(opcode, zone());
+  buffer_->Add(SIMD128Register::ToAllocationIndex(reg), zone());
+}
+
+
 void Translation::StoreStackSlot(int index) {
   buffer_->Add(STACK_SLOT, zone());
   buffer_->Add(index, zone());
@@ -2093,6 +3186,12 @@ void Translation::StoreBoolStackSlot(int index) {
 
 void Translation::StoreDoubleStackSlot(int index) {
   buffer_->Add(DOUBLE_STACK_SLOT, zone());
+  buffer_->Add(index, zone());
+}
+
+
+void Translation::StoreSIMD128StackSlot(int index, Opcode opcode) {
+  buffer_->Add(opcode, zone());
   buffer_->Add(index, zone());
 }
 
@@ -2132,11 +3231,17 @@ int Translation::NumberOfOperandsFor(Opcode opcode) {
     case UINT32_REGISTER:
     case BOOL_REGISTER:
     case DOUBLE_REGISTER:
+    case FLOAT32x4_REGISTER:
+    case FLOAT64x2_REGISTER:
+    case INT32x4_REGISTER:
     case STACK_SLOT:
     case INT32_STACK_SLOT:
     case UINT32_STACK_SLOT:
     case BOOL_STACK_SLOT:
     case DOUBLE_STACK_SLOT:
+    case FLOAT32x4_STACK_SLOT:
+    case FLOAT64x2_STACK_SLOT:
+    case INT32x4_STACK_SLOT:
     case LITERAL:
     case COMPILED_STUB_FRAME:
       return 1;
@@ -2789,6 +3894,12 @@ TranslatedFrame TranslatedState::CreateNextTranslatedFrame(
     case Translation::DOUBLE_STACK_SLOT:
     case Translation::LITERAL:
     case Translation::JS_FRAME_FUNCTION:
+    case Translation::FLOAT32x4_REGISTER:
+    case Translation::FLOAT64x2_REGISTER:
+    case Translation::INT32x4_REGISTER:
+      // We are at safepoint which corresponds to call.  All registers are
+      // saved by caller so there would be no live registers at this
+      // point. Thus these translation commands should not be used.
       break;
   }
   FATAL("We should never get here - unexpected deopt info.");
@@ -2974,6 +4085,24 @@ TranslatedValue TranslatedState::CreateNextTranslatedValue(
       return TranslatedValue::NewDouble(this, value);
     }
 
+    case Translation::FLOAT32x4_STACK_SLOT: {
+      int slot_index = iterator->Next();
+      Address slot_addr = SlotAddress(frame, slot_index);
+      return SlotRef(slot_addr, SlotRef::FLOAT32x4);
+    }
+
+    case Translation::FLOAT64x2_STACK_SLOT: {
+      int slot_index = iterator->Next();
+      Address slot_addr = SlotAddress(frame, slot_index);
+      return SlotRef(slot_addr, SlotRef::FLOAT64x2);
+    }
+
+    case Translation::INT32x4_STACK_SLOT: {
+      int slot_index = iterator->Next();
+      Address slot_addr = SlotAddress(frame, slot_index);
+      return SlotRef(slot_addr, SlotRef::INT32x4);
+    }
+
     case Translation::LITERAL: {
       int literal_index = iterator->Next();
       Object* value = literal_array->get(literal_index);
@@ -3089,6 +4218,27 @@ void TranslatedState::Init(Address input_frame_pointer,
         }
       }
     }
+
+    case DOUBLE: {
+      double value = read_double_value(addr_);
+      return isolate->factory()->NewNumber(value);
+    }
+
+    case FLOAT32x4:
+      return isolate->factory()->NewFloat32x4(read_simd128_value(addr_).f4);
+
+    case FLOAT64x2:
+      return isolate->factory()->NewFloat64x2(read_simd128_value(addr_).d2);
+
+    case INT32x4:
+      return isolate->factory()->NewInt32x4(read_simd128_value(addr_).i4);
+
+    case LITERAL:
+      return literal_;
+
+    default:
+      FATAL("We should never get here - unexpected deopt info.");
+      return Handle<Object>::null();
   }
 
   CHECK(!iterator->HasNext() ||

@@ -14,6 +14,17 @@
 namespace v8 {
 namespace internal {
 
+
+static inline double read_double_value(Address p) {
+  double d;
+  memcpy(&d, p, sizeof(d));
+  return d;
+}
+
+static inline simd128_value_t read_simd128_value(Address p) {
+  return *reinterpret_cast<simd128_value_t*>(p);
+}
+
 class FrameDescription;
 class TranslationIterator;
 class DeoptimizedFrameInfo;
@@ -306,6 +317,21 @@ class HeapNumberMaterializationDescriptor BASE_EMBEDDED {
  private:
   T destination_;
   double value_;
+};
+
+
+template<typename T>
+class SIMD128MaterializationDescriptor BASE_EMBEDDED {
+ public:
+  SIMD128MaterializationDescriptor(T destination, simd128_value_t value)
+      : destination_(destination), value_(value) { }
+
+  T destination() const { return destination_; }
+  simd128_value_t value() const { return value_; }
+
+ private:
+  T destination_;
+  simd128_value_t value_;
 };
 
 
@@ -666,6 +692,31 @@ class Deoptimizer : public Malloced {
 
   Object* ComputeLiteral(int index) const;
 
+  void AddObjectStart(intptr_t slot_address, int argc, bool is_arguments);
+  void AddObjectDuplication(intptr_t slot, int object_index);
+  void AddObjectTaggedValue(intptr_t value);
+  void AddObjectDoubleValue(double value);
+  void AddObjectSIMD128Value(simd128_value_t value, int translation_opcode);
+  void AddDoubleValue(intptr_t slot_address, double value);
+  void AddSIMD128Value(intptr_t slot_address, simd128_value_t value,
+                       int translation_opcode);
+
+  bool ArgumentsObjectIsAdapted(int object_index) {
+    ObjectMaterializationDescriptor desc = deferred_objects_.at(object_index);
+    int reverse_jsframe_index = jsframe_count_ - desc.jsframe_index() - 1;
+    return jsframe_has_adapted_arguments_[reverse_jsframe_index];
+  }
+
+  Handle<JSFunction> ArgumentsObjectFunction(int object_index) {
+    ObjectMaterializationDescriptor desc = deferred_objects_.at(object_index);
+    int reverse_jsframe_index = jsframe_count_ - desc.jsframe_index() - 1;
+    return jsframe_functions_[reverse_jsframe_index];
+  }
+
+  // Helper function for heap object materialization.
+  Handle<Object> MaterializeNextHeapObject();
+  Handle<Object> MaterializeNextValue();
+
   static void GenerateDeoptimizationEntries(
       MacroAssembler* masm, int count, BailoutType type);
 
@@ -701,6 +752,10 @@ class Deoptimizer : public Malloced {
   // from the input frame's double registers.
   void CopyDoubleRegisters(FrameDescription* output_frame);
 
+  // Fill the given output frame's simd128 registers with the original values
+  // from the input frame's simd128 registers.
+  void CopySIMD128Registers(FrameDescription* output_frame);
+
   // Determines whether the input frame contains alignment padding by looking
   // at the dynamic alignment state slot inside the frame.
   bool HasAlignmentPadding(JSFunction* function);
@@ -722,6 +777,22 @@ class Deoptimizer : public Malloced {
   int jsframe_count_;
   // Array of output frame descriptions.
   FrameDescription** output_;
+
+  // Deferred values to be materialized.
+  List<Object*> deferred_objects_tagged_values_;
+  List<HeapNumberMaterializationDescriptor<int> >
+      deferred_objects_double_values_;
+  List<SIMD128MaterializationDescriptor<int> >
+      deferred_objects_float32x4_values_;
+  List<SIMD128MaterializationDescriptor<int> >
+      deferred_objects_float64x2_values_;
+  List<SIMD128MaterializationDescriptor<int> >
+      deferred_objects_int32x4_values_;
+  List<ObjectMaterializationDescriptor> deferred_objects_;
+  List<HeapNumberMaterializationDescriptor<Address> > deferred_heap_numbers_;
+  List<SIMD128MaterializationDescriptor<Address> > deferred_float32x4s_;
+  List<SIMD128MaterializationDescriptor<Address> > deferred_float64x2s_;
+  List<SIMD128MaterializationDescriptor<Address> > deferred_int32x4s_;
 
   // Key for lookup of previously materialized objects
   Address stack_fp_;
@@ -825,6 +896,11 @@ class FrameDescription {
 
   RegisterValues* GetRegisterValues() { return &register_values_; }
 
+  simd128_value_t GetSIMD128FrameSlot(unsigned offset) {
+    intptr_t* ptr = GetFrameSlotPointer(offset);
+    return read_simd128_value(reinterpret_cast<Address>(ptr));
+  }
+
   void SetFrameSlot(unsigned offset, intptr_t value) {
     *GetFrameSlotPointer(offset) = value;
   }
@@ -843,6 +919,8 @@ class FrameDescription {
     return register_values_.GetDoubleRegister(n);
   }
 
+  simd128_value_t GetSIMD128Register(unsigned n) const;
+
   void SetRegister(unsigned n, intptr_t value) {
     register_values_.SetRegister(n, value);
   }
@@ -850,6 +928,8 @@ class FrameDescription {
   void SetDoubleRegister(unsigned n, double value) {
     register_values_.SetDoubleRegister(n, value);
   }
+
+  void SetSIMD128Register(unsigned n, simd128_value_t value);
 
   intptr_t GetTop() const { return top_; }
   void SetTop(intptr_t top) { top_ = top; }
@@ -896,6 +976,8 @@ class FrameDescription {
     return OFFSET_OF(FrameDescription, register_values_.double_registers_);
   }
 
+  static int simd128_registers_offset();
+
   static int frame_size_offset() {
     return offsetof(FrameDescription, frame_size_);
   }
@@ -921,6 +1003,13 @@ class FrameDescription {
   uintptr_t frame_size_;  // Number of bytes.
   JSFunction* function_;
   RegisterValues register_values_;
+  intptr_t registers_[Register::kNumRegisters];
+#if V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM
+  // For these architectures, the simd128 registers cover the double registers.
+  simd128_value_t simd128_registers_[SIMD128Register::kMaxNumRegisters];
+#else
+  double double_registers_[DoubleRegister::kMaxNumRegisters];
+#endif
   intptr_t top_;
   intptr_t pc_;
   intptr_t fp_;
@@ -1004,29 +1093,35 @@ class TranslationIterator BASE_EMBEDDED {
 };
 
 
-#define TRANSLATION_OPCODE_LIST(V) \
-  V(BEGIN)                         \
-  V(JS_FRAME)                      \
-  V(CONSTRUCT_STUB_FRAME)          \
-  V(GETTER_STUB_FRAME)             \
-  V(SETTER_STUB_FRAME)             \
-  V(ARGUMENTS_ADAPTOR_FRAME)       \
-  V(COMPILED_STUB_FRAME)           \
-  V(DUPLICATED_OBJECT)             \
-  V(ARGUMENTS_OBJECT)              \
-  V(CAPTURED_OBJECT)               \
-  V(REGISTER)                      \
-  V(INT32_REGISTER)                \
-  V(UINT32_REGISTER)               \
-  V(BOOL_REGISTER)                 \
-  V(DOUBLE_REGISTER)               \
-  V(STACK_SLOT)                    \
-  V(INT32_STACK_SLOT)              \
-  V(UINT32_STACK_SLOT)             \
-  V(BOOL_STACK_SLOT)               \
-  V(DOUBLE_STACK_SLOT)             \
-  V(LITERAL)                       \
-  V(JS_FRAME_FUNCTION)
+#define TRANSLATION_OPCODE_LIST(V)                                             \
+  V(BEGIN)                                                                     \
+  V(JS_FRAME)                                                                  \
+  V(CONSTRUCT_STUB_FRAME)                                                      \
+  V(GETTER_STUB_FRAME)                                                         \
+  V(SETTER_STUB_FRAME)                                                         \
+  V(ARGUMENTS_ADAPTOR_FRAME)                                                   \
+  V(COMPILED_STUB_FRAME)                                                       \
+  V(DUPLICATED_OBJECT)                                                         \
+  V(ARGUMENTS_OBJECT)                                                          \
+  V(CAPTURED_OBJECT)                                                           \
+  V(REGISTER)                                                                  \
+  V(INT32_REGISTER)                                                            \
+  V(UINT32_REGISTER)                                                           \
+  V(BOOL_REGISTER)                                                             \
+  V(DOUBLE_REGISTER)                                                           \
+  V(FLOAT32x4_REGISTER)                                                        \
+  V(FLOAT64x2_REGISTER)                                                        \
+  V(INT32x4_REGISTER)                                                          \
+  V(STACK_SLOT)                                                                \
+  V(INT32_STACK_SLOT)                                                          \
+  V(UINT32_STACK_SLOT)                                                         \
+  V(BOOL_STACK_SLOT)                                                           \
+  V(DOUBLE_STACK_SLOT)                                                         \
+  V(FLOAT32x4_STACK_SLOT)                                                      \
+  V(FLOAT64x2_STACK_SLOT)                                                      \
+  V(INT32x4_STACK_SLOT)                                                        \
+  V(LITERAL)                                                                   \
+  V(JS_FRAME_FUNCTION)                                                         \
 
 
 class Translation BASE_EMBEDDED {
@@ -1065,11 +1160,13 @@ class Translation BASE_EMBEDDED {
   void StoreUint32Register(Register reg);
   void StoreBoolRegister(Register reg);
   void StoreDoubleRegister(DoubleRegister reg);
+  void StoreSIMD128Register(SIMD128Register reg, Opcode opcode);
   void StoreStackSlot(int index);
   void StoreInt32StackSlot(int index);
   void StoreUint32StackSlot(int index);
   void StoreBoolStackSlot(int index);
   void StoreDoubleStackSlot(int index);
+  void StoreSIMD128StackSlot(int index, Opcode opcode);
   void StoreLiteral(int literal_id);
   void StoreArgumentsObject(bool args_known, int args_index, int args_length);
   void StoreJSFrameFunction();
@@ -1088,6 +1185,127 @@ class Translation BASE_EMBEDDED {
   Zone* zone_;
 };
 
+
+class SlotRef BASE_EMBEDDED {
+ public:
+  enum SlotRepresentation {
+    UNKNOWN,
+    TAGGED,
+    INT32,
+    UINT32,
+    BOOLBIT,
+    DOUBLE,
+    FLOAT32x4,
+    FLOAT64x2,
+    INT32x4,
+    LITERAL,
+    DEFERRED_OBJECT,   // Object captured by the escape analysis.
+                       // The number of nested objects can be obtained
+                       // with the DeferredObjectLength() method
+                       // (the SlotRefs of the nested objects follow
+                       // this SlotRef in the depth-first order.)
+    DUPLICATE_OBJECT,  // Duplicated object of a deferred object.
+    ARGUMENTS_OBJECT   // Arguments object - only used to keep indexing
+                       // in sync, it should not be materialized.
+  };
+
+  SlotRef()
+      : addr_(NULL), representation_(UNKNOWN) { }
+
+  SlotRef(Address addr, SlotRepresentation representation)
+      : addr_(addr), representation_(representation) { }
+
+  SlotRef(Isolate* isolate, Object* literal)
+      : literal_(literal, isolate), representation_(LITERAL) { }
+
+  static SlotRef NewArgumentsObject(int length) {
+    SlotRef slot;
+    slot.representation_ = ARGUMENTS_OBJECT;
+    slot.deferred_object_length_ = length;
+    return slot;
+  }
+
+  static SlotRef NewDeferredObject(int length) {
+    SlotRef slot;
+    slot.representation_ = DEFERRED_OBJECT;
+    slot.deferred_object_length_ = length;
+    return slot;
+  }
+
+  SlotRepresentation Representation() { return representation_; }
+
+  static SlotRef NewDuplicateObject(int id) {
+    SlotRef slot;
+    slot.representation_ = DUPLICATE_OBJECT;
+    slot.duplicate_object_id_ = id;
+    return slot;
+  }
+
+  int GetChildrenCount() {
+    if (representation_ == DEFERRED_OBJECT ||
+        representation_ == ARGUMENTS_OBJECT) {
+      return deferred_object_length_;
+    } else {
+      return 0;
+    }
+  }
+
+  int DuplicateObjectId() { return duplicate_object_id_; }
+
+  Handle<Object> GetValue(Isolate* isolate);
+
+ private:
+  Address addr_;
+  Handle<Object> literal_;
+  SlotRepresentation representation_;
+  int deferred_object_length_;
+  int duplicate_object_id_;
+};
+
+class SlotRefValueBuilder BASE_EMBEDDED {
+ public:
+  SlotRefValueBuilder(
+      JavaScriptFrame* frame,
+      int inlined_frame_index,
+      int formal_parameter_count);
+
+  void Prepare(Isolate* isolate);
+  Handle<Object> GetNext(Isolate* isolate, int level);
+  void Finish(Isolate* isolate);
+
+  int args_length() { return args_length_; }
+
+ private:
+  List<Handle<Object> > materialized_objects_;
+  Handle<FixedArray> previously_materialized_objects_;
+  int prev_materialized_count_;
+  Address stack_frame_id_;
+  List<SlotRef> slot_refs_;
+  int current_slot_;
+  int args_length_;
+  int first_slot_index_;
+  bool should_deoptimize_;
+
+  static SlotRef ComputeSlotForNextArgument(
+      Translation::Opcode opcode,
+      TranslationIterator* iterator,
+      DeoptimizationInputData* data,
+      JavaScriptFrame* frame);
+
+  Handle<Object> GetPreviouslyMaterialized(Isolate* isolate, int length);
+
+  static Address SlotAddress(JavaScriptFrame* frame, int slot_index) {
+    if (slot_index >= 0) {
+      const int offset = JavaScriptFrameConstants::kLocal0Offset;
+      return frame->fp() + offset - (slot_index * kPointerSize);
+    } else {
+      const int offset = JavaScriptFrameConstants::kLastParameterOffset;
+      return frame->fp() + offset - ((slot_index + 1) * kPointerSize);
+    }
+  }
+
+  Handle<Object> GetDeferredObject(Isolate* isolate);
+};
 
 class MaterializedObjectStore {
  public:
