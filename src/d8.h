@@ -289,6 +289,23 @@ class Shell : public i::AllStatic {
     args.GetReturnValue().Set(ReadFromStdin(args.GetIsolate()));
   }
   static void Load(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void ArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Int8Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Uint8Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Int16Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Uint16Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Int32Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Uint32Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Float32Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Float32x4Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Float64x2Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Int32x4Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Float64Array(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Uint8ClampedArray(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void ArrayBufferSlice(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void ArraySubArray(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void ArraySet(const v8::FunctionCallbackInfo<v8::Value>& args);
   // The OS object on the global object contains methods for performing
   // operating system calls:
   //

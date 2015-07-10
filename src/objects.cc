@@ -1329,12 +1329,21 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {  // NOLINT
       os << '>';
       break;
     }
-    case FLOAT32X4_TYPE: {
+    case FLOAT32x4_TYPE:
       os << "<Float32x4: ";
       Float32x4::cast(this)->Float32x4Print(os);
-      os << ">";
+      os << '>';
       break;
-    }
+    case FLOAT64x2_TYPE:
+      os << "<Float64x2: ";
+      Float64x2::cast(this)->Float64x2Print(os);
+      os << '>';
+      break;
+    case INT32x4_TYPE:
+      os << "<Int32x4: ";
+      Int32x4::cast(this)->Int32x4Print(os);
+      os << '>';
+      break;
     case JS_PROXY_TYPE:
       os << "<JSProxy>";
       break;
@@ -1439,6 +1448,9 @@ void HeapObject::IterateBody(InstanceType type, int object_size,
     case JS_GLOBAL_OBJECT_TYPE:
     case JS_BUILTINS_OBJECT_TYPE:
     case JS_MESSAGE_OBJECT_TYPE:
+    case FLOAT32x4_TYPE:
+    case FLOAT64x2_TYPE:
+    case INT32x4_TYPE:
       JSObject::BodyDescriptor::IterateBody(this, object_size, v);
       break;
     case JS_FUNCTION_TYPE:
@@ -1529,9 +1541,42 @@ void HeapNumber::HeapNumberPrint(std::ostream& os) {  // NOLINT
 }
 
 
-void Float32x4::Float32x4Print(std::ostream& os) {  // NOLINT
-  os << get_lane(0) << ", " << get_lane(1) << ", " << get_lane(2) << ", "
-     << get_lane(3);
+void Float32x4::Float32x4Print(std::ostream& os) {
+  // The Windows version of vsnprintf can allocate when printing a %g string
+  // into a buffer that may not be big enough.  We don't want random memory
+  // allocation when producing post-crash stack traces, so we print into a
+  // buffer that is plenty big enough for any floating point number, then
+  // print that using vsnprintf (which may truncate but never allocate if
+  // there is no more space in the buffer).
+  EmbeddedVector<char, 100> buffer;
+  SNPrintF(buffer, "%.16g %.16g %.16g %.16g", x(), y(), z(), w());
+  os << buffer.start();
+}
+
+
+void Int32x4::Int32x4Print(std::ostream& os) {
+  // The Windows version of vsnprintf can allocate when printing a %g string
+  // into a buffer that may not be big enough.  We don't want random memory
+  // allocation when producing post-crash stack traces, so we print into a
+  // buffer that is plenty big enough for any floating point number, then
+  // print that using vsnprintf (which may truncate but never allocate if
+  // there is no more space in the buffer).
+  EmbeddedVector<char, 100> buffer;
+  SNPrintF(buffer, "%u %u %u %u", x(), y(), z(), w());
+  os << buffer.start();
+}
+
+
+void Float64x2::Float64x2Print(std::ostream& os) {
+  // The Windows version of vsnprintf can allocate when printing a %g string
+  // into a buffer that may not be big enough.  We don't want random memory
+  // allocation when producing post-crash stack traces, so we print into a
+  // buffer that is plenty big enough for any floating point number, then
+  // print that using vsnprintf (which may truncate but never allocate if
+  // there is no more space in the buffer).
+  EmbeddedVector<char, 100> buffer;
+  SNPrintF(buffer, "%.16g %.16g", x(), y());
+  os << buffer.start();
 }
 
 
@@ -1720,6 +1765,9 @@ const char* Representation::Mnemonic() const {
     case kTagged: return "t";
     case kSmi: return "s";
     case kDouble: return "d";
+    case kFloat32x4: return "float32x4";
+    case kFloat64x2: return "float64x2";
+    case kInt32x4: return "int32x44";
     case kInteger32: return "i";
     case kHeapObject: return "h";
     case kExternal: return "x";
@@ -12824,6 +12872,183 @@ MaybeHandle<Object> JSReceiver::SetElement(Handle<JSReceiver> object,
   Isolate* isolate = object->GetIsolate();
   LookupIterator it(isolate, object, index);
   return SetProperty(&it, value, language_mode, MAY_BE_STORE_FROM_KEYED);
+MaybeHandle<Object> JSReceiver::SetElement(Handle<JSReceiver> object,
+                                           uint32_t index, Handle<Object> value,
+                                           PropertyAttributes attributes,
+                                           LanguageMode language_mode) {
+  if (object->IsJSProxy()) {
+    return JSProxy::SetElementWithHandler(Handle<JSProxy>::cast(object), object,
+                                          index, value, language_mode);
+  }
+  return JSObject::SetElement(Handle<JSObject>::cast(object), index, value,
+                              attributes, language_mode);
+}
+
+
+MaybeHandle<Object> JSObject::SetOwnElement(Handle<JSObject> object,
+                                            uint32_t index,
+                                            Handle<Object> value,
+                                            PropertyAttributes attributes,
+                                            LanguageMode language_mode) {
+  DCHECK(!object->HasExternalArrayElements());
+  return JSObject::SetElement(object, index, value, attributes, language_mode,
+                              false);
+}
+
+
+MaybeHandle<Object> JSObject::SetElement(Handle<JSObject> object,
+                                         uint32_t index, Handle<Object> value,
+                                         PropertyAttributes attributes,
+                                         LanguageMode language_mode,
+                                         bool check_prototype,
+                                         SetPropertyMode set_mode) {
+  Isolate* isolate = object->GetIsolate();
+
+  if (object->HasExternalArrayElements() ||
+      object->HasFixedTypedArrayElements()) {
+    if (!value->IsNumber() && !value->IsFloat32x4() && !value->IsFloat64x2() &&
+        !value->IsInt32x4() && !value->IsUndefined()) {
+      ASSIGN_RETURN_ON_EXCEPTION(
+          isolate, value,
+          Execution::ToNumber(isolate, value), Object);
+    }
+  }
+
+  // Check access rights if needed.
+  if (object->IsAccessCheckNeeded()) {
+    if (!isolate->MayAccess(object)) {
+      isolate->ReportFailedAccessCheck(object);
+      RETURN_EXCEPTION_IF_SCHEDULED_EXCEPTION(isolate, Object);
+      return value;
+    }
+  }
+
+  if (object->IsJSGlobalProxy()) {
+    PrototypeIterator iter(isolate, object);
+    if (iter.IsAtEnd()) return value;
+    DCHECK(PrototypeIterator::GetCurrent(iter)->IsJSGlobalObject());
+    return SetElement(
+        Handle<JSObject>::cast(PrototypeIterator::GetCurrent(iter)), index,
+        value, attributes, language_mode, check_prototype, set_mode);
+  }
+
+  // Don't allow element properties to be redefined for external arrays.
+  if ((object->HasExternalArrayElements() ||
+          object->HasFixedTypedArrayElements()) &&
+      set_mode == DEFINE_PROPERTY) {
+    Handle<Object> number = isolate->factory()->NewNumberFromUint(index);
+    Handle<Object> args[] = { object, number };
+    THROW_NEW_ERROR(isolate, NewTypeError("redef_external_array_element",
+                                          HandleVector(args, arraysize(args))),
+                    Object);
+  }
+
+  // Normalize the elements to enable attributes on the property.
+  if ((attributes & (DONT_DELETE | DONT_ENUM | READ_ONLY)) != 0) {
+    Handle<SeededNumberDictionary> dictionary = NormalizeElements(object);
+    // Make sure that we never go back to fast case.
+    dictionary->set_requires_slow_elements();
+  }
+
+  if (!object->map()->is_observed()) {
+    return object->HasIndexedInterceptor()
+               ? SetElementWithInterceptor(object, index, value, attributes,
+                                           language_mode, check_prototype,
+                                           set_mode)
+               : SetElementWithoutInterceptor(object, index, value, attributes,
+                                              language_mode, check_prototype,
+                                              set_mode);
+  }
+
+  Maybe<PropertyAttributes> maybe =
+      JSReceiver::GetOwnElementAttribute(object, index);
+  if (!maybe.IsJust()) return MaybeHandle<Object>();
+  PropertyAttributes old_attributes = maybe.FromJust();
+
+  Handle<Object> old_value = isolate->factory()->the_hole_value();
+  Handle<Object> old_length_handle;
+  Handle<Object> new_length_handle;
+
+  if (old_attributes != ABSENT) {
+    if (GetOwnElementAccessorPair(object, index).is_null()) {
+      old_value = Object::GetElement(isolate, object, index).ToHandleChecked();
+    }
+  } else if (object->IsJSArray()) {
+    // Store old array length in case adding an element grows the array.
+    old_length_handle = handle(Handle<JSArray>::cast(object)->length(),
+                               isolate);
+  }
+
+  // Check for lookup interceptor
+  Handle<Object> result;
+  ASSIGN_RETURN_ON_EXCEPTION(
+      isolate, result,
+      object->HasIndexedInterceptor()
+          ? SetElementWithInterceptor(object, index, value, attributes,
+                                      language_mode, check_prototype, set_mode)
+          : SetElementWithoutInterceptor(object, index, value, attributes,
+                                         language_mode, check_prototype,
+                                         set_mode),
+      Object);
+
+  Handle<String> name = isolate->factory()->Uint32ToString(index);
+  maybe = GetOwnElementAttribute(object, index);
+  if (!maybe.IsJust()) return MaybeHandle<Object>();
+  PropertyAttributes new_attributes = maybe.FromJust();
+
+  if (old_attributes == ABSENT) {
+    if (object->IsJSArray() &&
+        !old_length_handle->SameValue(
+            Handle<JSArray>::cast(object)->length())) {
+      new_length_handle = handle(Handle<JSArray>::cast(object)->length(),
+                                 isolate);
+      uint32_t old_length = 0;
+      uint32_t new_length = 0;
+      CHECK(old_length_handle->ToArrayIndex(&old_length));
+      CHECK(new_length_handle->ToArrayIndex(&new_length));
+
+      RETURN_ON_EXCEPTION(
+          isolate, BeginPerformSplice(Handle<JSArray>::cast(object)), Object);
+      RETURN_ON_EXCEPTION(
+          isolate, EnqueueChangeRecord(object, "add", name, old_value), Object);
+      RETURN_ON_EXCEPTION(
+          isolate, EnqueueChangeRecord(object, "update",
+                                       isolate->factory()->length_string(),
+                                       old_length_handle),
+          Object);
+      RETURN_ON_EXCEPTION(
+          isolate, EndPerformSplice(Handle<JSArray>::cast(object)), Object);
+      Handle<JSArray> deleted = isolate->factory()->NewJSArray(0);
+      RETURN_ON_EXCEPTION(
+          isolate,
+          EnqueueSpliceRecord(Handle<JSArray>::cast(object), old_length,
+                              deleted, new_length - old_length),
+          Object);
+    } else {
+      RETURN_ON_EXCEPTION(
+          isolate, EnqueueChangeRecord(object, "add", name, old_value), Object);
+    }
+  } else if (old_value->IsTheHole()) {
+    RETURN_ON_EXCEPTION(
+        isolate, EnqueueChangeRecord(object, "reconfigure", name, old_value),
+        Object);
+  } else {
+    Handle<Object> new_value =
+        Object::GetElement(isolate, object, index).ToHandleChecked();
+    bool value_changed = !old_value->SameValue(*new_value);
+    if (old_attributes != new_attributes) {
+      if (!value_changed) old_value = isolate->factory()->the_hole_value();
+      RETURN_ON_EXCEPTION(
+          isolate, EnqueueChangeRecord(object, "reconfigure", name, old_value),
+          Object);
+    } else if (value_changed) {
+      RETURN_ON_EXCEPTION(
+          isolate, EnqueueChangeRecord(object, "update", name, old_value),
+          Object);
+    }
+  }
+
+  return result;
 }
 
 
@@ -14867,6 +15092,78 @@ void GlobalObject::InvalidatePropertyCell(Handle<GlobalObject> global,
   int entry = dictionary->FindEntry(name);
   if (entry == GlobalDictionary::kNotFound) return;
   PropertyCell::InvalidateEntry(dictionary, entry);
+}
+
+
+Handle<Object> ExternalFloat32x4Array::SetValue(
+    Handle<JSObject> holder, Handle<ExternalFloat32x4Array> array,
+    uint32_t index,
+    Handle<Object> value) {
+  float32x4_value_t cast_value;
+  cast_value.storage[0] =
+      static_cast<float>(std::numeric_limits<double>::quiet_NaN());
+  cast_value.storage[1] =
+      static_cast<float>(std::numeric_limits<double>::quiet_NaN());
+  cast_value.storage[2] =
+      static_cast<float>(std::numeric_limits<double>::quiet_NaN());
+  cast_value.storage[3] =
+      static_cast<float>(std::numeric_limits<double>::quiet_NaN());
+  if (index < static_cast<uint32_t>(array->length())) {
+    if (value->IsFloat32x4()) {
+      cast_value = Handle<Float32x4>::cast(value)->get();
+    } else {
+      // Clamp undefined to NaN (default). All other types have been
+      // converted to a number type further up in the call chain.
+      DCHECK(value->IsUndefined());
+    }
+    array->set(index, cast_value);
+  }
+  return array->GetIsolate()->factory()->NewFloat32x4(cast_value);
+}
+
+
+Handle<Object> ExternalInt32x4Array::SetValue(
+    Handle<JSObject> holder,
+    Handle<ExternalInt32x4Array> array,
+    uint32_t index, Handle<Object> value) {
+  int32x4_value_t cast_value;
+  cast_value.storage[0] = 0;
+  cast_value.storage[1] = 0;
+  cast_value.storage[2] = 0;
+  cast_value.storage[3] = 0;
+  if (index < static_cast<uint32_t>(array->length())) {
+    if (value->IsInt32x4()) {
+      cast_value = Handle<Int32x4>::cast(value)->get();
+    } else {
+      // Clamp undefined to zero (default). All other types have been
+      // converted to a number type further up in the call chain.
+      DCHECK(value->IsUndefined());
+    }
+    array->set(index, cast_value);
+  }
+  return array->GetIsolate()->factory()->NewInt32x4(cast_value);
+}
+
+
+Handle<Object> ExternalFloat64x2Array::SetValue(
+    Handle<JSObject> holder,
+    Handle<ExternalFloat64x2Array> array,
+    uint32_t index,
+    Handle<Object> value) {
+  float64x2_value_t cast_value;
+  cast_value.storage[0] = std::numeric_limits<double>::quiet_NaN();
+  cast_value.storage[1] = std::numeric_limits<double>::quiet_NaN();
+  if (index < static_cast<uint32_t>(array->length())) {
+    if (value->IsFloat64x2()) {
+      cast_value = Handle<Float64x2>::cast(value)->get();
+    } else {
+      // Clamp undefined to NaN (default). All other types have been
+      // converted to a number type further up in the call chain.
+      DCHECK(value->IsUndefined());
+    }
+    array->set(index, cast_value);
+  }
+  return array->GetIsolate()->factory()->NewFloat64x2(cast_value);
 }
 
 

@@ -165,6 +165,36 @@ MaybeHandle<Object> Runtime::KeyedGetObjectProperty(
           RETURN_ON_EXCEPTION(
               isolate, TransitionElements(js_object, elements_kind, isolate),
               Object);
+    JSObject::ValidateElements(js_object);
+    if (js_object->HasExternalArrayElements() ||
+        js_object->HasFixedTypedArrayElements()) {
+      if (!value->IsNumber() &&  !value->IsFloat32x4() &&
+          !value->IsFloat64x2() && !value->IsInt32x4() &&
+          !value->IsUndefined()) {
+        ASSIGN_RETURN_ON_EXCEPTION(isolate, value,
+                                   Execution::ToNumber(isolate, value), Object);
+      }
+    }
+
+    MaybeHandle<Object> result = JSObject::SetElement(
+        js_object, index, value, NONE, language_mode, true, SET_PROPERTY);
+    JSObject::ValidateElements(js_object);
+
+    return result.is_null() ? result : value;
+  }
+
+  if (key->IsName()) {
+    Handle<Name> name = Handle<Name>::cast(key);
+    if (name->AsArrayIndex(&index)) {
+      // TODO(verwaest): Support non-JSObject receivers.
+      if (!object->IsJSObject()) return value;
+      Handle<JSObject> js_object = Handle<JSObject>::cast(object);
+      if (js_object->HasExternalArrayElements()) {
+        if (!value->IsNumber() &&  !value->IsFloat32x4() &&
+            !value->IsFloat64x2() && !value->IsInt32x4() &&
+            !value->IsUndefined()) {
+          ASSIGN_RETURN_ON_EXCEPTION(
+              isolate, value, Execution::ToNumber(isolate, value), Object);
         }
       } else {
         DCHECK(IsFastSmiOrObjectElementsKind(elements_kind) ||

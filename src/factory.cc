@@ -1039,11 +1039,103 @@ Handle<HeapNumber> Factory::NewHeapNumber(double value,
 }
 
 
-Handle<Float32x4> Factory::NewFloat32x4(float w, float x, float y, float z,
+Handle<Float32x4> Factory::NewFloat32x4(float32x4_value_t value,
                                         PretenureFlag pretenure) {
-  CALL_HEAP_FUNCTION(
-      isolate(), isolate()->heap()->AllocateFloat32x4(w, x, y, z, pretenure),
-      Float32x4);
+  Handle<JSFunction> constructor(
+      isolate()->native_context()->float32x4_function());
+  Handle<JSObject> jsobject = NewJSObject(constructor);
+  Handle<Float32x4> float32x4(Float32x4::cast(*jsobject));
+  Handle<FixedTypedArrayBase> storage =
+      this->NewFixedTypedArray(static_cast<int>(1), kExternalFloat32x4Array);
+  FixedFloat32x4Array::cast(*storage)->set(0, value);
+  float32x4->set_value(*storage);
+  return float32x4;
+}
+
+
+Handle<Float64x2> Factory::NewFloat64x2(float64x2_value_t value,
+                                        PretenureFlag pretenure) {
+  Handle<JSFunction> constructor(
+      isolate()->native_context()->float64x2_function());
+  Handle<JSObject> jsobject = NewJSObject(constructor);
+  Handle<Float64x2> float64x2(Float64x2::cast(*jsobject));
+  Handle<FixedTypedArrayBase> storage =
+      this->NewFixedTypedArray(static_cast<int>(1), kExternalFloat64x2Array);
+  FixedFloat64x2Array::cast(*storage)->set(0, value);
+  float64x2->set_value(*storage);
+  return float64x2;
+}
+
+
+Handle<Int32x4> Factory::NewInt32x4(int32x4_value_t value,
+                                    PretenureFlag pretenure) {
+  Handle<JSFunction> constructor(
+      isolate()->native_context()->int32x4_function());
+  Handle<JSObject> jsobject = NewJSObject(constructor);
+  Handle<Int32x4> int32x4(Int32x4::cast(*jsobject));
+  Handle<FixedTypedArrayBase> storage =
+      this->NewFixedTypedArray(static_cast<int>(1), kExternalInt32x4Array);
+  FixedInt32x4Array::cast(*storage)->set(0, value);
+  int32x4->set_value(*storage);
+  return int32x4;
+}
+
+
+Handle<Object> Factory::NewTypeError(const char* message,
+                                     Vector<Handle<Object> > args) {
+  return NewError("MakeTypeError", message, args);
+}
+
+
+Handle<Object> Factory::NewTypeError(Handle<String> message) {
+  return NewError("$TypeError", message);
+}
+
+
+Handle<Object> Factory::NewRangeError(const char* message,
+                                      Vector<Handle<Object> > args) {
+  return NewError("MakeRangeError", message, args);
+}
+
+
+Handle<Object> Factory::NewRangeError(Handle<String> message) {
+  return NewError("$RangeError", message);
+}
+
+
+Handle<Object> Factory::NewSyntaxError(const char* message,
+                                       Handle<JSArray> args) {
+  return NewError("MakeSyntaxError", message, args);
+}
+
+
+Handle<Object> Factory::NewSyntaxError(Handle<String> message) {
+  return NewError("$SyntaxError", message);
+}
+
+
+Handle<Object> Factory::NewReferenceError(const char* message,
+                                          Handle<JSArray> args) {
+  return NewError("MakeReferenceError", message, args);
+}
+
+
+Handle<Object> Factory::NewReferenceError(Handle<String> message) {
+  return NewError("$ReferenceError", message);
+}
+
+
+Handle<Object> Factory::NewError(const char* maker, const char* message,
+                                 Vector<Handle<Object> > args) {
+  // Instantiate a closeable HandleScope for EscapeFrom.
+  v8::EscapableHandleScope scope(reinterpret_cast<v8::Isolate*>(isolate()));
+  Handle<FixedArray> array = NewFixedArray(args.length());
+  for (int i = 0; i < args.length(); i++) {
+    array->set(i, *args[i]);
+  }
+  Handle<JSArray> object = NewJSArrayWithElements(array);
+  Handle<Object> result = NewError(maker, message, object);
+  return result.EscapeFrom(&scope);
 }
 
 
@@ -1308,6 +1400,9 @@ Handle<JSFunction> Factory::NewFunction(Handle<String> name, Handle<Code> code,
   ElementsKind elements_kind =
       type == JS_ARRAY_TYPE ? FAST_SMI_ELEMENTS : FAST_HOLEY_SMI_ELEMENTS;
   Handle<Map> initial_map = NewMap(type, instance_size, elements_kind);
+  if (type == FLOAT32x4_TYPE) {
+    initial_map->set_is_extensible(false);
+  }
   if (!function->shared()->is_generator()) {
     if (prototype->IsTheHole()) {
       prototype = NewFunctionPrototype(function);
